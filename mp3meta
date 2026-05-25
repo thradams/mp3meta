@@ -1,0 +1,454 @@
+/*
+ * mp3meta.c - Walk a directory and set ID3v2 tags on all MP3 files.
+ *
+ * Build (MinGW / MSVC):
+ *   gcc -Wall -O2 -o mp3meta.exe mp3meta.c
+ *   cl /W3 /O2 mp3meta.c /Fe:mp3meta.exe
+ *
+ * Usage:
+ *   mp3meta.exe [OPTIONS] <directory>
+ *
+ * Options:
+ *   -artist  "Artist Name"
+ *   -album   "Album Name"
+ *   -title   "Track Title"     (applied to every file; usually skip this)
+ *   -year    "2024"
+ *   -genre   "Rock"
+ *   -track   "01"
+ *   -comment "Any comment"
+ *   -r                          Recurse into subdirectories
+ *   -dry                        Dry-run: show what would be changed, don't write
+ *
+ * Examples:
+ *   mp3meta.exe -artist "Pink Floyd" -album "The Wall" -year "1979" C:\Music\TheWall
+ *   mp3meta.exe -r -artist "Bach" C:\Music
+ *   mp3meta.exe -dry -genre "Jazz" C:\Music\Jazz
+ *
+ * The program writes a minimal ID3v2.3 tag.  Any existing ID3v2 tag is
+ * replaced; ID3v1 tags (last 128 bytes) are preserved unchanged.
+ * Fields you do NOT specify on the command line are left untouched
+ * (read from the existing tag if one is present).
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+ /* ------------------------------------------------------------------ */
+ /* ID3v2 helpers                                                        */
+ /* ------------------------------------------------------------------ */
+
+ /* ID3v2 header is 10 bytes:
+  *   "ID3"  3 bytes
+  *   version (2 bytes: major, revision)
+  *   flags  1 byte
+  *   size   4 bytes synchsafe integer (28 usable bits)
+  */
+
+#define ID3_HEADER_SIZE   10
+#define ID3_FRAME_HEADER  10   /* frame id(4) + size(4) + flags(2) */
+#define MAX_FRAME_DATA    4096 /* max text we read from an existing tag */
+
+typedef struct {
+    char  artist[MAX_FRAME_DATA];
+    char  album[MAX_FRAME_DATA];
+    char  title[MAX_FRAME_DATA];
+    char  year[MAX_FRAME_DATA];
+    char  genre[MAX_FRAME_DATA];
+    char  track[MAX_FRAME_DATA];
+    char  comment[MAX_FRAME_DATA];
+} Tags;
+
+/* Decode a 4-byte synchsafe integer (ID3v2 tag/frame sizes) */
+static uint32_t synchsafe_decode(const uint8_t b[4])
+{
+    return ((uint32_t)b[0] << 21) |
+        ((uint32_t)b[1] << 14) |
+        ((uint32_t)b[2] << 7) |
+        (uint32_t)b[3];
+}
+
+/* Encode a 32-bit value as 4-byte synchsafe integer */
+static void synchsafe_encode(uint32_t v, uint8_t b[4])
+{
+    b[3] = v & 0x7F; v >>= 7;
+    b[2] = v & 0x7F; v >>= 7;
+    b[1] = v & 0x7F; v >>= 7;
+    b[0] = v & 0x7F;
+}
+
+/* Write big-endian 32-bit (used for frame size in ID3v2.3) */
+static void be32(uint32_t v, uint8_t b[4])
+{
+    b[0] = (v >> 24) & 0xFF;
+    b[1] = (v >> 16) & 0xFF;
+    b[2] = (v >> 8) & 0xFF;
+    b[3] = v & 0xFF;
+}
+
+/* Read existing ID3v2 tag from file into Tags struct.
+ * Returns the total byte size of the existing tag (0 if none). */
+static uint32_t read_existing_tag(FILE* f, Tags* t)
+{
+    uint8_t hdr[ID3_HEADER_SIZE];
+    if (fread(hdr, 1, ID3_HEADER_SIZE, f) < ID3_HEADER_SIZE) return 0;
+    if (memcmp(hdr, "ID3", 3) != 0) return 0;
+
+    uint8_t major = hdr[3];
+    if (major < 3 || major > 4) return 0; /* only v2.3 / v2.4 */
+
+    uint32_t tag_size = synchsafe_decode(hdr + 6);
+    uint32_t remaining = tag_size;
+
+    uint8_t frame_hdr[ID3_FRAME_HEADER];
+    while (remaining >= (uint32_t)ID3_FRAME_HEADER) {
+        if (fread(frame_hdr, 1, ID3_FRAME_HEADER, f) < (size_t)ID3_FRAME_HEADER) break;
+        remaining -= ID3_FRAME_HEADER;
+
+        /* Frame id must be printable ASCII */
+        if (!frame_hdr[0]) break; /* padding */
+
+        uint32_t fsz;
+        if (major == 4)
+            fsz = synchsafe_decode(frame_hdr + 4);
+        else {
+            /* ID3v2.3: plain big-endian */
+            fsz = ((uint32_t)frame_hdr[4] << 24) |
+                ((uint32_t)frame_hdr[5] << 16) |
+                ((uint32_t)frame_hdr[6] << 8) |
+                (uint32_t)frame_hdr[7];
+        }
+
+        if (fsz > remaining) break;
+        remaining -= fsz;
+
+        char id[5];
+        memcpy(id, frame_hdr, 4); id[4] = '\0';
+
+        /* Read frame data */
+        char* dst = NULL;
+        if (!strcmp(id, "TPE1")) dst = t->artist;
+        else if (!strcmp(id, "TALB")) dst = t->album;
+        else if (!strcmp(id, "TIT2")) dst = t->title;
+        else if (!strcmp(id, "TDRC") || !strcmp(id, "TYER")) dst = t->year;
+        else if (!strcmp(id, "TCON")) dst = t->genre;
+        else if (!strcmp(id, "TRCK")) dst = t->track;
+        else if (!strcmp(id, "COMM")) dst = t->comment;
+
+        if (dst && fsz >= 1 && fsz < MAX_FRAME_DATA) {
+            uint8_t enc;
+            fread(&enc, 1, 1, f);
+            uint32_t text_len = fsz - 1;
+            /* For COMM there's a 3-byte language + short description first */
+            if (!strcmp(id, "COMM")) {
+                uint32_t skip = 3;
+                fseek(f, skip, SEEK_CUR);
+                /* skip null-terminated short description */
+                int c;
+                while (text_len > 0 && (c = fgetc(f)) != EOF && c != 0) text_len--;
+                if (text_len > 0) text_len--; /* null byte */
+            }
+            if (text_len > 0 && text_len < MAX_FRAME_DATA) {
+                size_t got = fread(dst, 1, text_len, f);
+                dst[got] = '\0';
+                /* strip leading encoding byte garbage if Latin-1 */
+                long skip_back = (long)text_len - (long)got;
+                if (skip_back) fseek(f, skip_back, SEEK_CUR);
+            }
+            else {
+                fseek(f, (long)text_len, SEEK_CUR);
+            }
+        }
+        else {
+            fseek(f, (long)fsz, SEEK_CUR);
+        }
+    }
+
+    return ID3_HEADER_SIZE + tag_size;
+}
+
+/* Write a single ID3v2.3 text frame into buffer.
+ * Returns number of bytes written. */
+static size_t write_frame(uint8_t* buf, const char* id, const char* text)
+{
+    size_t text_len = strlen(text);
+    size_t frame_sz = 1 + text_len; /* encoding byte + text */
+
+    /* Frame header */
+    memcpy(buf, id, 4);
+    be32((uint32_t)frame_sz, buf + 4);
+    buf[8] = 0; buf[9] = 0; /* flags */
+    /* Encoding: 0x00 = Latin-1 / ISO-8859-1 */
+    buf[10] = 0x00;
+    memcpy(buf + 11, text, text_len);
+    return ID3_FRAME_HEADER + frame_sz;
+}
+
+/* Build the complete ID3v2.3 tag from Tags into a heap buffer.
+ * Caller must free() the returned pointer.
+ * *out_size receives the total byte count. */
+static uint8_t* build_tag(const Tags* t, size_t* out_size)
+{
+    /* Upper bound: 7 frames * (10 header + 1 enc + 4096 data) */
+    size_t cap = 7 * (ID3_FRAME_HEADER + 1 + MAX_FRAME_DATA) + ID3_HEADER_SIZE + 256;
+    uint8_t* buf = (uint8_t*)calloc(cap, 1);
+    if (!buf) return NULL;
+
+    uint8_t* p = buf + ID3_HEADER_SIZE; /* reserve header space */
+    size_t used = 0;
+
+#define WRITE_IF(id, field) \
+    if ((field)[0]) { size_t n = write_frame(p, id, field); p += n; used += n; }
+
+    WRITE_IF("TPE1", t->artist)
+        WRITE_IF("TALB", t->album)
+        WRITE_IF("TIT2", t->title)
+        WRITE_IF("TYER", t->year)   /* ID3v2.3 year frame */
+        WRITE_IF("TCON", t->genre)
+        WRITE_IF("TRCK", t->track)
+        if (t->comment[0]) {
+            /* COMM frame: encoding(1) + lang(3) + short_desc(\0) + text */
+            size_t clen = strlen(t->comment);
+            size_t fsz = 1 + 3 + 1 + clen;
+            memcpy(p, "COMM", 4);
+            be32((uint32_t)fsz, p + 4);
+            p[8] = 0; p[9] = 0;
+            p[10] = 0x00;          /* encoding Latin-1 */
+            memcpy(p + 11, "eng", 3);
+            p[14] = 0x00;          /* empty short description */
+            memcpy(p + 15, t->comment, clen);
+            p += ID3_FRAME_HEADER + fsz;
+            used += ID3_FRAME_HEADER + fsz;
+        }
+#undef WRITE_IF
+
+    /* Write ID3v2.3 header into the reserved space */
+    buf[0] = 'I'; buf[1] = 'D'; buf[2] = '3';
+    buf[3] = 0x03; buf[4] = 0x00; /* version 2.3.0 */
+    buf[5] = 0x00;                 /* flags */
+    synchsafe_encode((uint32_t)used, buf + 6);
+
+    *out_size = ID3_HEADER_SIZE + used;
+    return buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* File processing                                                     */
+/* ------------------------------------------------------------------ */
+
+static int g_dry = 0;
+
+static void process_file(const char* path, const Tags* user_tags)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "  Cannot open: %s\n", path);
+        return;
+    }
+
+    /* Read existing tags */
+    Tags tags;
+    memset(&tags, 0, sizeof(tags));
+    uint32_t old_tag_size = read_existing_tag(f, &tags);
+
+    /* Read the rest of the file (actual audio data) */
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+
+    long audio_start = (long)old_tag_size;
+    long audio_size = file_size - audio_start;
+    if (audio_size < 0) audio_size = 0;
+
+    uint8_t* audio = NULL;
+    if (audio_size > 0) {
+        audio = (uint8_t*)malloc((size_t)audio_size);
+        if (!audio) {
+            fprintf(stderr, "  Out of memory: %s\n", path);
+            fclose(f);
+            return;
+        }
+        fseek(f, audio_start, SEEK_SET);
+        if (fread(audio, 1, (size_t)audio_size, f) != (size_t)audio_size) {
+            fprintf(stderr, "  Read error: %s\n", path);
+            free(audio);
+            fclose(f);
+            return;
+        }
+    }
+    fclose(f);
+
+    /* Overlay user-supplied tags (non-empty strings override existing) */
+#define OVERLAY(field) if ((user_tags->field)[0]) strncpy(tags.field, user_tags->field, MAX_FRAME_DATA-1)
+    OVERLAY(artist);
+    OVERLAY(album);
+    OVERLAY(title);
+    OVERLAY(year);
+    OVERLAY(genre);
+    OVERLAY(track);
+    OVERLAY(comment);
+#undef OVERLAY
+
+    printf("  %s\n", path);
+    if (tags.artist[0])  printf("    Artist : %s\n", tags.artist);
+    if (tags.album[0])   printf("    Album  : %s\n", tags.album);
+    if (tags.title[0])   printf("    Title  : %s\n", tags.title);
+    if (tags.year[0])    printf("    Year   : %s\n", tags.year);
+    if (tags.genre[0])   printf("    Genre  : %s\n", tags.genre);
+    if (tags.track[0])   printf("    Track  : %s\n", tags.track);
+    if (tags.comment[0]) printf("    Comment: %s\n", tags.comment);
+
+    if (g_dry) {
+        printf("    [dry-run, not written]\n");
+        free(audio);
+        return;
+    }
+
+    /* Build new tag */
+    size_t new_tag_size = 0;
+    uint8_t* new_tag = build_tag(&tags, &new_tag_size);
+    if (!new_tag) {
+        fprintf(stderr, "  Tag build failed: %s\n", path);
+        free(audio);
+        return;
+    }
+
+    /* Write new file: new_tag + audio */
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "  Cannot write: %s\n", path);
+        free(new_tag);
+        free(audio);
+        return;
+    }
+
+    int ok = 1;
+    if (fwrite(new_tag, 1, new_tag_size, f) != new_tag_size) ok = 0;
+    if (ok && audio_size > 0 && fwrite(audio, 1, (size_t)audio_size, f) != (size_t)audio_size) ok = 0;
+
+    fclose(f);
+    free(new_tag);
+    free(audio);
+
+    if (!ok)
+        fprintf(stderr, "  Write error: %s\n", path);
+    else
+        printf("    [written OK]\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Directory walker                                                    */
+/* ------------------------------------------------------------------ */
+
+static void walk_dir(const char* dir, int recurse, const Tags* user_tags)
+{
+    char pattern[MAX_PATH];
+    snprintf(pattern, MAX_PATH, "%s\\*", dir);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Cannot open directory: %s\n", dir);
+        return;
+    }
+
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+
+        char full[MAX_PATH];
+        snprintf(full, MAX_PATH, "%s\\%s", dir, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (recurse) walk_dir(full, recurse, user_tags);
+        }
+        else {
+            /* Check .mp3 extension (case-insensitive) */
+            size_t len = strlen(fd.cFileName);
+            if (len > 4) {
+                const char* ext = fd.cFileName + len - 4;
+                if (!_stricmp(ext, ".mp3"))
+                    process_file(full, user_tags);
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
+
+static void usage(const char* prog)
+{
+    printf("Usage: %s [OPTIONS] <directory>\n\n"
+        "Options:\n"
+        "  -artist  \"Name\"      Set artist (TPE1)\n"
+        "  -album   \"Name\"      Set album  (TALB)\n"
+        "  -title   \"Name\"      Set title  (TIT2)\n"
+        "  -year    \"2024\"      Set year   (TYER)\n"
+        "  -genre   \"Rock\"      Set genre  (TCON)\n"
+        "  -track   \"01\"        Set track  (TRCK)\n"
+        "  -comment \"Text\"      Set comment (COMM)\n"
+        "  -r                   Recurse into subdirectories\n"
+        "  -dry                 Dry-run: print changes, don't write\n\n"
+        "Example:\n"
+        "  %s -artist \"Pink Floyd\" -album \"The Wall\" -year 1979 C:\\Music\\TheWall\n",
+        prog, prog);
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 2) { usage(argv[0]); return 1; }
+
+    Tags user_tags;
+    memset(&user_tags, 0, sizeof(user_tags));
+    int recurse = 0;
+    const char* dir = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (!_stricmp(argv[i], "-artist") && i + 1 < argc) { strncpy(user_tags.artist, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-album") && i + 1 < argc) { strncpy(user_tags.album, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-title") && i + 1 < argc) { strncpy(user_tags.title, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-year") && i + 1 < argc) { strncpy(user_tags.year, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-genre") && i + 1 < argc) { strncpy(user_tags.genre, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-track") && i + 1 < argc) { strncpy(user_tags.track, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-comment") && i + 1 < argc) { strncpy(user_tags.comment, argv[++i], MAX_FRAME_DATA - 1); }
+        else if (!_stricmp(argv[i], "-r")) { recurse = 1; }
+        else if (!_stricmp(argv[i], "-dry")) { g_dry = 1; }
+        else if (argv[i][0] != '-') { dir = argv[i]; }
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1; }
+    }
+
+    if (!dir) dir = ".";
+
+    /* Check at least one tag was provided */
+    if (!user_tags.artist[0] && !user_tags.album[0] && !user_tags.title[0] &&
+        !user_tags.year[0] && !user_tags.genre[0] && !user_tags.track[0] &&
+        !user_tags.comment[0]) {
+        fprintf(stderr, "Error: specify at least one tag to set.\n\n");
+        usage(argv[0]);
+        return 1;
+    }
+
+    printf("Directory : %s\n", dir);
+    printf("Recurse   : %s\n", recurse ? "yes" : "no");
+    printf("Dry-run   : %s\n", g_dry ? "yes" : "no");
+    printf("Tags to set:\n");
+    if (user_tags.artist[0])  printf("  Artist : %s\n", user_tags.artist);
+    if (user_tags.album[0])   printf("  Album  : %s\n", user_tags.album);
+    if (user_tags.title[0])   printf("  Title  : %s\n", user_tags.title);
+    if (user_tags.year[0])    printf("  Year   : %s\n", user_tags.year);
+    if (user_tags.genre[0])   printf("  Genre  : %s\n", user_tags.genre);
+    if (user_tags.track[0])   printf("  Track  : %s\n", user_tags.track);
+    if (user_tags.comment[0]) printf("  Comment: %s\n", user_tags.comment);
+    printf("\nProcessing files:\n");
+
+    walk_dir(dir, recurse, &user_tags);
+
+    printf("\nDone.\n");
+    return 0;
+}
